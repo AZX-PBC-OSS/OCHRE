@@ -58,6 +58,8 @@ SCHEDULE_NAMES = {
         "clothes_dryer_exhaust": None,
         "lighting_exterior_holiday": None,
         "plug_loads_vehicle": None,
+        "electric_vehicle_charging": None,
+        "electric_vehicle_discharging": None,
         "battery": None,
         "vacancy": None,
         "water_heater_operating_mode": None,

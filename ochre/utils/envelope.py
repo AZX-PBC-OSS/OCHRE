@@ -244,6 +244,14 @@ def get_boundary_rc_values(all_bd_properties, raise_error=False, **house_args):
         if insulation is not None:
             bd_choices = bd_choices.loc[bd_choices["Insulation Details"] == insulation]
 
+        if len(bd_choices) == 0 and construction is not None:
+            # Retry without construction type filter (e.g. ResStock "Flat" garage roofs not in materials table)
+            bd_choices = boundary_types.loc[boundary_types["Boundary Name"] == bd_name].copy()
+            bd_choices["Boundary R Value"] = bd_choices["Assembly R Value"] + film_r
+            if finish is not None:
+                bd_choices = bd_choices.loc[bd_choices["Finish Type"] == finish]
+            if insulation is not None:
+                bd_choices = bd_choices.loc[bd_choices["Insulation Details"] == insulation]
         if len(bd_choices) == 0:
             keys = ["Construction Type", "Finish Type", "Insulation Details"]
             p = {key: val for key, val in bd_properties.items() if key in keys}

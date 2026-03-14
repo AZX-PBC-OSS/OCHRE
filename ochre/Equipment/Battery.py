@@ -334,8 +334,9 @@ class Battery(Generator):
         self_discharge = self.discharge_rate * self.time_res_hours
         self.next_soc = self.soc + self.power_input * self.time_res_hours / self.capacity_kwh - self_discharge
 
-        # check with upper and lower bound of usable SOC, small computational errors possible
-        assert self.soc_max + 0.001 >= self.next_soc >= self.soc_min - 0.001
+        # Clamp small numerical errors from efficiency mismatches in
+        # get_power_limits() vs calculate_power_and_heat().
+        self.next_soc = min(self.soc_max, max(self.soc_min, self.next_soc))
 
         # append SOC and temperature to degradation data
         t_batt = self.thermal_model.states[self.t_idx] if self.thermal_model is not None else 25

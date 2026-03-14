@@ -428,8 +428,12 @@ def parse_hpxml_boundaries(hpxml, return_boundary_dicts=False, **kwargs):
     top_floor_areas = [
         area for floor_option in top_floor_options for area in boundaries.get(floor_option, {}).get("Area (m^2)", [])
     ]
-    if len(top_floor_areas) == 1:
-        top_floor_area = top_floor_areas[0]  # area of first (lowest above grade) floor. Excludes garage
+    unique_top_floor_areas = list(dict.fromkeys(top_floor_areas))  # deduplicate preserving order
+    if len(unique_top_floor_areas) == 1:
+        top_floor_area = unique_top_floor_areas[0]
+    elif len(unique_top_floor_areas) > 1:
+        # Multiple distinct top-floor boundary sections (e.g. main attic + adjacent ceiling) — sum them
+        top_floor_area = sum(unique_top_floor_areas)
     else:
         raise OCHREException(f"Unable to parse multiple attic floor areas: {top_floor_areas}")
     attic_floor_area = top_floor_area + sum(boundaries.get("Garage Ceiling", {}).get("Area (m^2)", []))
