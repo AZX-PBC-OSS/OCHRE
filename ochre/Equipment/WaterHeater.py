@@ -76,6 +76,8 @@ class WaterHeater(Equipment):
         self.deadband_temp = kwargs.get("Deadband Temperature (C)", 5.56)  # deadband range, in delta degC, i.e. Kelvin
         self.max_power = kwargs.get("Max Power (kW)")
 
+        self._heats_to_tank_buf = np.zeros(self.model.n_nodes, dtype=float)
+
     def update_inputs(self, schedule_inputs=None):
         # Add zone temperature to schedule inputs for water tank
         if not self.main_simulator:
@@ -249,7 +251,8 @@ class WaterHeater(Equipment):
 
     def add_heat_from_mode(self, mode, heats_to_tank=None, duty_cycle=1):
         if heats_to_tank is None:
-            heats_to_tank = np.zeros(self.model.n_nodes, dtype=float)
+            self._heats_to_tank_buf.fill(0)
+            heats_to_tank = self._heats_to_tank_buf
 
         if mode == "Upper On":
             heats_to_tank[self.h_upper_idx] += self.capacity_rated * duty_cycle
@@ -262,7 +265,8 @@ class WaterHeater(Equipment):
     def calculate_power_and_heat(self):
         # get heat injections from water heater
         if self.use_ideal_capacity and self.mode != "Off":
-            heats_to_tank = np.zeros(self.model.n_nodes, dtype=float)
+            self._heats_to_tank_buf.fill(0)
+            heats_to_tank = self._heats_to_tank_buf
             for mode, duty_cycle in self.duty_cycle_by_mode.items():
                 heats_to_tank = self.add_heat_from_mode(mode, heats_to_tank, duty_cycle)
         else:
@@ -626,9 +630,14 @@ class HeatPumpWaterHeater(ElectricResistanceWaterHeater):
 
     def update_cop_and_capacity(self, t_wet):
         t_lower = np.dot(self.hp_nodes, self.model.states)  # use node connected to condenser
-        vector = np.array([1, t_wet, t_wet**2, t_lower, t_lower**2, t_lower * t_wet])
-        self.hp_capacity = self.hp_capacity_nominal * np.dot(self.hp_capacity_coeff, vector)
-        self.hp_cop = self.cop_nominal * np.dot(self.cop_coeff, vector)
+        cc = self.hp_capacity_coeff
+        self.hp_capacity = self.hp_capacity_nominal * (
+            cc[0] + cc[1] * t_wet + cc[2] * t_wet**2 + cc[3] * t_lower + cc[4] * t_lower**2 + cc[5] * t_lower * t_wet
+        )
+        ce = self.cop_coeff
+        self.hp_cop = self.cop_nominal * (
+            ce[0] + ce[1] * t_wet + ce[2] * t_wet**2 + ce[3] * t_lower + ce[4] * t_lower**2 + ce[5] * t_lower * t_wet
+        )
 
     def calculate_power_and_heat(self):
         t_dry = self.current_schedule["Zone Temperature (C)"]

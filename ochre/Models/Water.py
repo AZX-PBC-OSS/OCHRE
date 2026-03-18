@@ -53,12 +53,19 @@ class StratifiedWaterModel(RCModel):
             self.n_nodes = len(water_vol_fractions)
             self.vol_fractions = np.array(water_vol_fractions) / sum(water_vol_fractions)
 
+        self.vol_fractions.flags.writeable = False
+        self._vol_cumsum = self.vol_fractions.cumsum()
+
         self.volume = kwargs["Tank Volume (L)"]  # in L
 
         capacitances, resistances = self.load_rc_data(**kwargs)
 
         super().__init__(capacitances, resistances, external_nodes=["AMB"], **kwargs)
         self.next_states = self.states  # for holding state info for next time step
+
+        self._control_buf = np.zeros(self.nx + 1)
+        self._heats_buf = np.zeros(self.nx)
+        self._inputs_init_buf = np.zeros(self.nx + 1)
 
         self.t_amb_idx = self.input_names.index("T_AMB")
         assert self.t_amb_idx == 0  # should always be first
@@ -131,7 +138,8 @@ class StratifiedWaterModel(RCModel):
         return {name: t_init for name in state_names}
 
     def update_water_draw(self):
-        heats_to_model = np.zeros(self.nx)
+        self._heats_buf.fill(0)
+        heats_to_model = self._heats_buf
         self.mains_temp = self.current_schedule.get("Mains Temperature (C)")
         self.outlet_temp = self.states[self.t_1_idx]  # initial outlet temp, for estimating draw volume
 
@@ -247,7 +255,9 @@ class StratifiedWaterModel(RCModel):
         heats_to_model = self.update_water_draw()
 
         # update water tank model
-        self.inputs_init = np.concatenate(([t_zone], heats_to_model))
+        self._inputs_init_buf[0] = t_zone
+        self._inputs_init_buf[1:] = heats_to_model
+        self.inputs_init = self._inputs_init_buf
 
     def run_inversion_mixing_rule(self):
         # Inversion Mixing Rule
@@ -262,7 +272,10 @@ class StratifiedWaterModel(RCModel):
             # new temp is the max of any possible mixings
             heats = self.next_states * self.vol_fractions  # note: excluding c_p and volume factors
             heat_sums = heats[node_idx:].cumsum()
-            vol_sums = self.vol_fractions[node_idx:].cumsum()
+            if node_idx == 0:
+                vol_sums = self._vol_cumsum
+            else:
+                vol_sums = self._vol_cumsum[node_idx:] - self._vol_cumsum[node_idx - 1]
             new_temp = (heat_sums / vol_sums).max()
 
             # Allow inversion mixing if a significant difference in temperature exists
@@ -275,7 +288,7 @@ class StratifiedWaterModel(RCModel):
                 self.next_states[node_idx] = new_temp
                 self.next_states[node_idx + 1] -= q / self.vol_fractions[node_idx + 1]
 
-                if not any(np.diff(self.next_states) > 0.1):
+                if not (np.diff(self.next_states) > 0.1).any():
                     # no more inversions
                     return
 
@@ -296,8 +309,10 @@ class StratifiedWaterModel(RCModel):
         if control_signal is not None:
             # control signal must be heat injections from water heater, by node
             assert isinstance(control_signal, np.ndarray) and len(control_signal) == self.nx
-            self.h_injections = sum(control_signal)
-            control_signal = self.inputs_init + np.insert(control_signal, 0, 0)  # adds heat injections in inputs_init
+            self.h_injections = control_signal.sum()
+            self._control_buf[0] = 0.0
+            self._control_buf[1:] = control_signal
+            control_signal = self.inputs_init + self._control_buf
         else:
             self.h_injections = 0
 
@@ -313,7 +328,7 @@ class StratifiedWaterModel(RCModel):
 
         # If any temperatures are inverted, run inversion mixing algorithm
         delta_t = 0.1 if self.high_res else 0.01
-        if any(np.diff(self.next_states) > delta_t):
+        if (np.diff(self.next_states) > delta_t).any():
             self.run_inversion_mixing_rule()
 
     def update_results(self):

@@ -10,11 +10,13 @@ from scipy.interpolate import interp1d
 from ochre.utils import OCHREException
 from ochre.utils.units import kwh_to_therms
 from ochre.Equipment import Equipment
+from ochre.Simulator import KIND_EQUIPMENT, KIND_GENERATOR
 
 
 class Generator(Equipment):
     allow_consumption = False
     is_gas = False
+    _kind = KIND_EQUIPMENT | KIND_GENERATOR
     zone_name = None
     optional_inputs = ["net_power"]
 

@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 
 from ochre import Simulator, Analysis
+from ochre.Simulator import KIND_EQUIPMENT, KIND_GENERATOR, KIND_BATTERY
 from ochre.utils import (
     OCHREException,
     load_hpxml,
@@ -177,6 +178,10 @@ class Dwelling(Simulator):
         # add envelope to sub_simulators after all equipment
         self.sub_simulators.append(self.envelope)
 
+        self._same_resolution = all(
+            sub.time_res == self.time_res for sub in self.sub_simulators
+        )
+
         # Run initialization to get realistic initial state
         if self.initialization_time is not None:
             self.initialize()
@@ -267,18 +272,18 @@ class Dwelling(Simulator):
         sub_control_signal = super().start_sub_update(sub, control_signal)
 
         # Add house net_power to schedule for Generator
-        if isinstance(sub, Generator) and "net_power" not in sub.current_schedule:
+        if sub._kind & KIND_GENERATOR and "net_power" not in sub.current_schedule:
             sub.current_schedule["net_power"] = self.total_p_kw
 
         # Add pv_power to schedule for Battery
-        if isinstance(sub, Battery) and "pv_power" not in sub.current_schedule:
+        if sub._kind & KIND_BATTERY and "pv_power" not in sub.current_schedule:
             pv_power = sum([e.electric_kw for e in self.equipment_by_end_use["PV"]])
             sub.current_schedule["pv_power"] = pv_power
 
         return sub_control_signal
 
     def finish_sub_update(self, sub):
-        if isinstance(sub, Equipment):
+        if sub._kind & KIND_EQUIPMENT:
             # update total electric and gas powers
             self.total_p_kw += sub.electric_kw
             self.total_q_kvar += sub.reactive_kvar
