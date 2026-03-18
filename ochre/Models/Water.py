@@ -1,4 +1,5 @@
 import numpy as np
+import numba as nb
 
 from ochre.Models import RCModel, ModelException
 from ochre.utils import convert
@@ -9,6 +10,143 @@ water_density_liters = 1  # kg/L
 water_cp = 4.183  # kJ/kg-K
 water_conductivity = 0.6406  # W/m-K
 water_c = water_cp * water_density_liters * 1000  # heat capacity with useful units: J/K-L
+
+
+@nb.njit(cache=True)
+def _water_draw_general(states, vol_fractions, capacitances, draw_fraction, mains_temp, water_c_val, draw_liters, q_nodes_out):
+    """Returns (outlet_temp, q_delivered). Writes q_nodes into q_nodes_out."""
+    n = len(states)
+
+    min_vf = vol_fractions[0]
+    for i in range(1, n):
+        if vol_fractions[i] < min_vf:
+            min_vf = vol_fractions[i]
+
+    if draw_fraction < min_vf:
+        outlet_temp = states[0]
+        q_delivered = draw_liters * water_c_val * (outlet_temp - mains_temp)
+        for i in range(n - 1):
+            q_nodes_out[i] = draw_liters * water_c_val * (states[i + 1] - states[i])
+        q_nodes_out[n - 1] = draw_liters * water_c_val * (mains_temp - states[n - 1])
+        return outlet_temp, q_delivered
+
+    n1 = n + 1
+    vols_pre = np.empty(n1)
+    vols_post = np.empty(n1)
+    temps = np.empty(n1)
+
+    running = 0.0
+    for i in range(n):
+        running += vol_fractions[i]
+        vols_pre[i] = running
+    vols_pre[n] = running + draw_fraction
+
+    vols_post[0] = draw_fraction
+    running = draw_fraction
+    for i in range(n):
+        running += vol_fractions[i]
+        vols_post[i + 1] = running
+
+    for i in range(n):
+        temps[i] = states[i]
+    temps[n] = mains_temp
+
+    outlet_temp = 0.0
+    prev = 0.0
+    for i in range(n1):
+        clipped = min(vols_pre[i], draw_fraction)
+        vol_del = clipped - prev
+        outlet_temp += temps[i] * vol_del
+        prev = clipped
+    outlet_temp /= draw_fraction
+    q_delivered = draw_liters * water_c_val * (outlet_temp - mains_temp)
+
+    for i in range(n):
+        t_end = 0.0
+        prev_v = vols_post[i]
+        for j in range(n1):
+            clipped = min(max(vols_pre[j], vols_post[i]), vols_post[i + 1])
+            vol_del = clipped - prev_v
+            t_end += temps[j] * vol_del
+            prev_v = clipped
+        t_end /= vol_fractions[i]
+        q_nodes_out[i] = (t_end - states[i]) * capacitances[i]
+
+    return outlet_temp, q_delivered
+
+
+@nb.njit(cache=True)
+def _water_draw_2node(
+    states,
+    vol_fractions,
+    capacitances,
+    draw_fraction,
+    mains_temp,
+    water_c_val,
+    draw_liters,
+    flow_fraction,
+    q_nodes_out,
+):
+    """Returns (outlet_temp, q_delivered). 2-node fast path."""
+    outlet_temp = states[0]
+    if draw_fraction > vol_fractions[0]:
+        outlet_temp = (states[0] * vol_fractions[0] + states[1] * (draw_fraction - vol_fractions[0])) / draw_fraction
+    q_delivered = draw_liters * water_c_val * (outlet_temp - mains_temp)
+
+    q_to_mains_lower = capacitances[1] * (states[1] - mains_temp)
+    if q_delivered * flow_fraction > q_to_mains_lower:
+        q_nodes_out[0] = q_to_mains_lower - q_delivered
+        q_nodes_out[1] = -q_to_mains_lower
+    else:
+        q_nodes_out[0] = -q_delivered * (1.0 - flow_fraction)
+        q_nodes_out[1] = -q_delivered * flow_fraction
+
+    return outlet_temp, q_delivered
+
+
+@nb.njit(cache=True)
+def _inversion_mixing(next_states, vol_fractions, vol_cumsum, capacitances):
+    """Modifies next_states in-place. Returns True if algorithm and energy checks pass."""
+    n = len(next_states)
+    init_heat = 0.0
+    for i in range(n):
+        init_heat += next_states[i] * capacitances[i]
+
+    for node_idx in range(n - 1):
+        current_temp = next_states[node_idx]
+
+        new_temp = current_temp
+        heat_sum = 0.0
+        base_vol = 0.0
+        if node_idx > 0:
+            base_vol = vol_cumsum[node_idx - 1]
+
+        for j in range(node_idx, n):
+            heat_sum += next_states[j] * vol_fractions[j]
+            vol_sum = vol_cumsum[j] - base_vol
+            mixed = heat_sum / vol_sum
+            if mixed > new_temp:
+                new_temp = mixed
+
+        if new_temp > current_temp + 0.001:
+            q = (new_temp - current_temp) * vol_fractions[node_idx]
+            next_states[node_idx] = new_temp
+            next_states[node_idx + 1] -= q / vol_fractions[node_idx + 1]
+
+            has_inversion = False
+            for j in range(n - 1):
+                if next_states[j + 1] - next_states[j] > 0.1:
+                    has_inversion = True
+                    break
+            if not has_inversion:
+                break
+        elif new_temp < current_temp - 0.001:
+            return False
+
+    final_heat = 0.0
+    for i in range(n):
+        final_heat += next_states[i] * capacitances[i]
+    return abs(final_heat - init_heat) < 1.0
 
 
 class StratifiedWaterModel(RCModel):
@@ -66,6 +204,8 @@ class StratifiedWaterModel(RCModel):
         self._control_buf = np.zeros(self.nx + 1)
         self._heats_buf = np.zeros(self.nx)
         self._inputs_init_buf = np.zeros(self.nx + 1)
+        self._q_nodes_jit_buf = np.zeros(self.n_nodes)
+        self._state_diff_buf = np.empty(self.n_nodes, dtype=float)
 
         self.t_amb_idx = self.input_names.index("T_AMB")
         assert self.t_amb_idx == 0  # should always be first
@@ -187,52 +327,33 @@ class StratifiedWaterModel(RCModel):
         t_s = self._dt_seconds
         draw_liters = self.draw_total * t_s / 60  # in liters
         draw_fraction = draw_liters / self.volume  # unitless
+        q_nodes = self._q_nodes_jit_buf
 
         if self.n_nodes == 2 and draw_fraction < self.vol_fractions[1]:
             # Use empirical factor for determining water flow by node
             flow_fraction = 0.95  # Totally empirical factor based on detailed lab validation
-            if draw_fraction > self.vol_fractions[0]:
-                # outlet temp is volume-weighted average of lower and upper temps
-                self.outlet_temp = (
-                    self.states[0] * self.vol_fractions[0] + self.states[1] * (draw_fraction - self.vol_fractions[0])
-                ) / draw_fraction
-            q_delivered = draw_liters * water_c * (self.outlet_temp - self.mains_temp)  # in J
-
-            # q_to_mains_upper = self.state_capacitances[0] * (self.x[0] - self.mains_temp)
-            q_to_mains_lower = self.capacitances[1] * (self.states[1] - self.mains_temp)
-            if q_delivered * flow_fraction > q_to_mains_lower:
-                # If you'd fully cool the bottom node to mains, set bottom node to mains and cool top node
-                q_nodes = np.array([q_to_mains_lower - q_delivered, -q_to_mains_lower])
-            else:
-                q_nodes = np.array([-q_delivered * (1 - flow_fraction), -q_delivered * flow_fraction])
-
+            self.outlet_temp, q_delivered = _water_draw_2node(
+                self.states,
+                self.vol_fractions,
+                self.capacitances,
+                draw_fraction,
+                self.mains_temp,
+                water_c,
+                draw_liters,
+                flow_fraction,
+                q_nodes,
+            )
         else:
-            if draw_fraction < min(self.vol_fractions):
-                # water draw is smaller than all node volumes
-                q_delivered = draw_liters * water_c * (self.outlet_temp - self.mains_temp)  # in J
-                # all volume transfers are from the node directly below
-                q_nodes = draw_liters * water_c * np.diff(self.states, append=self.mains_temp)  # in J
-            else:
-                # calculate volume transfers to/from each node, including q_delivered
-                vols_pre = np.append(self.vol_fractions, draw_fraction).cumsum()
-                vols_post = np.insert(self.vol_fractions, 0, draw_fraction).cumsum()
-                temps = np.append(self.states, self.mains_temp)
-
-                # update outlet temp as a weighted average of temps, by volume
-                vols_delivered = np.diff(vols_pre.clip(max=draw_fraction), prepend=0)
-                self.outlet_temp = np.dot(temps, vols_delivered) / draw_fraction
-                q_delivered = draw_liters * water_c * (self.outlet_temp - self.mains_temp)  # in J
-
-                # calculate heat in/out of each node (in J)
-                q_nodes = []
-                for i in range(self.n_nodes):
-                    t_start = temps[i]
-                    vols_delivered = np.diff(
-                        vols_pre.clip(min=vols_post[i], max=vols_post[i + 1]), prepend=vols_post[i]
-                    )
-                    t_end = np.dot(temps, vols_delivered) / self.vol_fractions[i]
-                    q_nodes.append((t_end - t_start) * self.capacitances[i])
-                q_nodes = np.array(q_nodes)
+            self.outlet_temp, q_delivered = _water_draw_general(
+                self.states,
+                self.vol_fractions,
+                self.capacitances,
+                draw_fraction,
+                self.mains_temp,
+                water_c,
+                draw_liters,
+                q_nodes,
+            )
 
         # convert heat transfer from J to W
         self.h_delivered = q_delivered / t_s
@@ -265,44 +386,10 @@ class StratifiedWaterModel(RCModel):
         #     p. 1528
         # Starting from the top, check for mixing at each node
 
-        init_states = self.next_states.copy()
-        for node_idx in range(self.n_nodes - 1):
-            current_temp = self.next_states[node_idx]
-
-            # new temp is the max of any possible mixings
-            heats = self.next_states * self.vol_fractions  # note: excluding c_p and volume factors
-            heat_sums = heats[node_idx:].cumsum()
-            if node_idx == 0:
-                vol_sums = self._vol_cumsum
-            else:
-                vol_sums = self._vol_cumsum[node_idx:] - self._vol_cumsum[node_idx - 1]
-            new_temp = (heat_sums / vol_sums).max()
-
-            # Allow inversion mixing if a significant difference in temperature exists
-            if new_temp > current_temp + 0.001:  # small computational errors are possible
-                # print('Inversion mixing occuring at node {}. Temperature raises from {} to {}'.format(
-                #     node + 1, self.x[node], new_temp))
-
-                # calculate heat transfer, update temperatures of current node and node below
-                q = (new_temp - current_temp) * self.vol_fractions[node_idx]
-                self.next_states[node_idx] = new_temp
-                self.next_states[node_idx + 1] -= q / self.vol_fractions[node_idx + 1]
-
-                if not (np.diff(self.next_states) > 0.1).any():
-                    # no more inversions
-                    return
-
-            elif new_temp < current_temp - 0.001:  # small computational errors are possible:
-                msg = "Error in inversion mixing algorithm. New temperature ({}) less than previous ({}) at node {}."
-                raise ModelException(msg.format(new_temp, self.next_states[node_idx], node_idx + 1))
-
-        # check final heat to ensure no losses from mixing
-        heat_check = np.dot(self.next_states - init_states, self.capacitances)  # in J
-        if not abs(heat_check) < 1:
+        ok = _inversion_mixing(self.next_states, self.vol_fractions, self._vol_cumsum, self.capacitances)
+        if not ok:
             raise ModelException(
-                "Large error ({}) in water heater inversion mixing algorithm.Final state temperatures are: {}".format(
-                    heat_check, self.next_states
-                )
+                "Error in water heater inversion mixing algorithm. Final state temperatures are: {}".format(self.next_states)
             )
 
     def update_model(self, control_signal=None):
@@ -318,7 +405,8 @@ class StratifiedWaterModel(RCModel):
 
         super().update_model(control_signal)
 
-        q_change = (self.next_states - self.states).dot(self.capacitances)  # in J
+        np.subtract(self.next_states, self.states, out=self._state_diff_buf)
+        q_change = self._state_diff_buf.dot(self.capacitances)  # in J
         h_change = q_change / self._dt_seconds
 
         # calculate heat loss, in W

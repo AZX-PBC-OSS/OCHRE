@@ -265,10 +265,10 @@ class RCModel(StateSpaceModel):
 
     @staticmethod
     def par(*args):
-        if any([a == 0 for a in args]):
+        if any(a == 0 for a in args):
             return 0
         else:
-            return 1 / sum([1 / a for a in args])
+            return 1 / sum(1 / a for a in args)
 
     def solve_for_input(self, y_idx, u_idx, x_desired, solve_as_output=None):
         # if 1 state or output is fixed, solve for 1 input that controls state to desired setpoint

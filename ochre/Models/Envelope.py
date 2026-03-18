@@ -1,5 +1,6 @@
 import numpy as np
 import datetime as dt
+import numba as nb
 
 from ochre.utils import OCHREException
 from ochre.utils.units import convert, degC_to_K, cfm_to_m3s
@@ -14,6 +15,152 @@ rho_air = 1.2041  # kg/m^3, used for determining capacitance only
 _T_BASE_C = convert(73, "degF", "degC")
 _M2_TO_CM2 = convert(1, "m^2", "cm^2")
 _M3HR_TO_M3S = convert(1, "m^3/hr", "m^3/s")
+
+
+@nb.njit(cache=True, fastmath=True)
+def _infiltration_ashrae(delta_t, wind_speed, inf_c, inf_Cs, inf_Cw, inf_sft, inf_n_i):
+    inf_flow_temp = inf_c * inf_Cs * abs(delta_t) ** inf_n_i
+    inf_flow_wind = inf_c * inf_Cw * (inf_sft * wind_speed) ** (2.0 * inf_n_i)
+    return (inf_flow_temp * inf_flow_temp + inf_flow_wind * inf_flow_wind) ** 0.5
+
+
+@nb.njit(cache=True, fastmath=True)
+def _natural_ventilation(
+    t_zone,
+    t_ext,
+    t_base,
+    w_amb,
+    wind_speed,
+    open_window_area,
+    nat_vent_stack_coeff,
+    nat_vent_wind_coeff,
+    volume,
+    m2_to_cm2,
+    m3hr_to_m3s,
+    max_oa_hr,
+):
+    if w_amb >= max_oa_hr or t_zone <= t_ext or t_zone <= t_base:
+        return 0.0
+    if open_window_area <= 0.0:
+        return 0.0
+
+    delta_t = t_ext - t_zone
+    area = open_window_area * 0.6
+    nat_vent_area = area * m2_to_cm2
+    max_nat_flow = 20.0 * volume * m3hr_to_m3s
+    adj = (t_zone - t_base) / (t_zone - t_ext)
+    adj = max(min(adj, 1.0), 0.0)
+    nat_vent_data = nat_vent_stack_coeff * abs(delta_t) + nat_vent_wind_coeff * (wind_speed * wind_speed)
+    nat_vent_flow = nat_vent_area * adj * (nat_vent_data**0.5) / 1000.0
+    return min(nat_vent_flow, max_nat_flow)
+
+
+@nb.njit(cache=True)
+def _ventilation_flows_and_gain(
+    inf_flow,
+    nat_vent_flow,
+    forced_vent_flow,
+    balanced_ventilation,
+    sens_recovery_eff,
+    lat_recovery_eff,
+    density,
+    delta_t,
+    h_limit,
+    has_h_limit,
+):
+    total_nat_flow = inf_flow + nat_vent_flow
+    if balanced_ventilation:
+        sensible_flow = total_nat_flow + forced_vent_flow * (1.0 - sens_recovery_eff)
+        latent_flow = total_nat_flow + forced_vent_flow * (1.0 - lat_recovery_eff)
+    else:
+        sensible_flow = (total_nat_flow * total_nat_flow + forced_vent_flow * forced_vent_flow) ** 0.5
+        latent_flow = sensible_flow
+        if total_nat_flow > 0.0:
+            nat_flow_ratio = (sensible_flow - forced_vent_flow) / total_nat_flow
+            inf_flow *= nat_flow_ratio
+            nat_vent_flow *= nat_flow_ratio
+
+    sensible_gain = sensible_flow * density * 1.006 * delta_t * 1000.0
+    if has_h_limit and abs(sensible_gain) > abs(h_limit):
+        sensible_gain = h_limit
+
+    return sensible_gain, sensible_flow, latent_flow, inf_flow, nat_vent_flow
+
+
+@nb.njit(cache=True, fastmath=True)
+def _solve_interior_radiation(
+    s_e_factors,
+    s_rad_fractions,
+    s_rad_resistances,
+    s_view_factors,
+    t_boundaries,
+    t_surfaces,
+    t_surfaces_prev,
+    t_zone,
+    max_iters,
+    degc_to_k,
+):
+    t_surf_no_rad = s_rad_fractions * t_boundaries + (1.0 - s_rad_fractions) * t_zone
+    t_surf_min = t_surf_no_rad.min()
+    t_surf_max = t_surf_no_rad.max()
+
+    for _ in range(max_iters):
+        h_lwr_out = s_e_factors * (t_surfaces + degc_to_k) ** 4
+        h_lwr_in = h_lwr_out.sum() * s_view_factors
+        t_new = t_surf_no_rad + (h_lwr_in - h_lwr_out) * s_rad_resistances
+        t_new = np.clip(t_new, t_surf_min, t_surf_max)
+        t_new = t_surfaces + 0.3 * (t_new - t_surfaces) + 0.2 * (t_surfaces - t_surfaces_prev)
+        delta = np.abs(t_new - t_surfaces).max()
+        t_surfaces_prev[:] = t_surfaces
+        t_surfaces[:] = t_new
+        if delta < 0.01:
+            break
+
+    h_lwr_out = s_e_factors * (t_surfaces + degc_to_k) ** 4
+    h_lwr_in = h_lwr_out.sum() * s_view_factors
+    return h_lwr_in - h_lwr_out
+
+
+@nb.njit(cache=True, fastmath=True)
+def _solve_exterior_radiation(
+    e_factors,
+    sky_view_factors,
+    rad_fractions,
+    rad_resistances,
+    t_boundaries,
+    temperatures,
+    t_prevs,
+    solar_gains,
+    t_ext,
+    t_sky,
+    t_sky_valid,
+    max_iters,
+    degc_to_k,
+):
+    n = len(e_factors)
+    lwr_gains = np.empty(n)
+    t_ext_k4 = (t_ext + degc_to_k) ** 4
+    t_sky_k4 = (t_sky + degc_to_k) ** 4
+    for b in range(n):
+        if not t_sky_valid:
+            h_lwr_inj = e_factors[b] * t_ext_k4
+        else:
+            svf = sky_view_factors[b]
+            h_lwr_inj = e_factors[b] * ((1.0 - svf) * t_ext_k4 + svf * t_sky_k4)
+        t_surf_init = rad_fractions[b] * t_boundaries[b] + (1.0 - rad_fractions[b]) * t_ext
+
+        for _ in range(max_iters):
+            lwr = h_lwr_inj - e_factors[b] * (temperatures[b] + degc_to_k) ** 4
+            t_new = t_surf_init + (solar_gains[b] + lwr) * rad_resistances[b]
+            t_new = min(max(t_new, temperatures[b] - 2.0), temperatures[b] + 2.0)
+            t_surf = temperatures[b] + 0.5 * (t_new - temperatures[b]) + 0.1 * (temperatures[b] - t_prevs[b])
+            t_prevs[b] = temperatures[b]
+            temperatures[b] = t_surf
+            if abs(temperatures[b] - t_prevs[b]) < 0.01:
+                break
+
+        lwr_gains[b] = h_lwr_inj - e_factors[b] * (temperatures[b] + degc_to_k) ** 4
+    return lwr_gains
 
 
 class BoundarySurface:
@@ -324,6 +471,29 @@ class Zone:
             None: [],
         }
         self.infiltration_parameters = {param: zone_args[param] for param in inf_params[self.infiltration_method]}
+        self._inf_n_i = 0.0
+        self._inf_sft = 0.0
+        self._inf_c = 0.0
+        self._inf_Cs = 0.0
+        self._inf_Cw = 0.0
+        self._ela = 0.0
+        self._ela_stack = 0.0
+        self._ela_wind = 0.0
+        self._ach = 0.0
+        if self.infiltration_method == "ASHRAE":
+            params = self.infiltration_parameters
+            self._inf_c = params["inf_c"]
+            self._inf_Cs = params["inf_Cs"]
+            self._inf_Cw = params["inf_Cw"]
+            self._inf_sft = params["inf_sft"]
+            self._inf_n_i = params["inf_n_i"]
+        elif self.infiltration_method == "ELA":
+            params = self.infiltration_parameters
+            self._ela = params["ELA (cm^2)"]
+            self._ela_stack = params["ELA stack coefficient (L/s/cm^4/K)"]
+            self._ela_wind = params["ELA wind coefficient (L/s/cm^4/(m/s))"]
+        elif self.infiltration_method == "ACH":
+            self._ach = self.infiltration_parameters["Air Changes (1/hour)"]
 
         # Forced ventilation parameters - Indoor zone only for now
         # self.max_flow_rate = self.volume / kwargs['time_res'].total_seconds()  # in m^3/s
@@ -340,8 +510,8 @@ class Zone:
         # TODO: why use ASHRAE for infiltration and ELA for natural ventilation?
         self.nat_vent_heat = 0  # in W
         self.nat_vent_flow = 0  # m^3/s
-        self.nat_vent_stack_coeff = zone_args.get("ELA stack coefficient (L/s/cm^4/K)")
-        self.nat_vent_wind_coeff = zone_args.get("ELA wind coefficient (L/s/cm^4/(m/s))")
+        self.nat_vent_stack_coeff = zone_args.get("ELA stack coefficient (L/s/cm^4/K)", 0.0)
+        self.nat_vent_wind_coeff = zone_args.get("ELA wind coefficient (L/s/cm^4/(m/s))", 0.0)
         self.open_window_area = None
 
     def create_surfaces(self, boundaries: list[Boundary]):
@@ -407,27 +577,23 @@ class Zone:
         # Calculates flow rate and heat gain from infiltration and ventilation (forced and natural)
         # Calculate infiltration flow, depending on the infiltration method
         # See E+ EMS program in idf file: infil_program (inf_flow = Qinf)
+        wind_speed = 0.0 if wind_speed is None else wind_speed
+        w_amb = 0.0 if w_amb is None else w_amb
         delta_t = t_ext - t_zone
         if self.infiltration_method == "ASHRAE":
-            params = self.infiltration_parameters
-            inf_flow_temp = params["inf_c"] * params["inf_Cs"] * abs(delta_t) ** params["inf_n_i"]
-            inf_flow_wind = (
-                params["inf_c"] * params["inf_Cw"] * (params["inf_sft"] * wind_speed) ** (2 * params["inf_n_i"])
+            self.inf_flow = _infiltration_ashrae(
+                delta_t, wind_speed, self._inf_c, self._inf_Cs, self._inf_Cw, self._inf_sft, self._inf_n_i
             )
-            self.inf_flow = (inf_flow_temp**2 + inf_flow_wind**2) ** 0.5
 
         elif self.infiltration_method == "ACH":
-            self.inf_flow = self.infiltration_parameters["Air Changes (1/hour)"] * self.volume / 3600
+            self.inf_flow = self._ach * self.volume / 3600
 
         elif self.infiltration_method == "ELA":
             # FUTURE: update attic wind coefficient based on height. Inputs are in properties file already
             # see https://bigladdersoftware.com/epx/docs/8-6/input-output-reference/group-airflow.html
             #  - zoneinfiltrationeffectiveleakagearea
             f = 1
-            ela = self.infiltration_parameters["ELA (cm^2)"]
-            ela_stack = self.infiltration_parameters["ELA stack coefficient (L/s/cm^4/K)"]
-            ela_wind = self.infiltration_parameters["ELA wind coefficient (L/s/cm^4/(m/s))"]
-            self.inf_flow = f * ela / 1000 * (ela_stack * abs(delta_t) + ela_wind * wind_speed**2) ** 0.5
+            self.inf_flow = f * self._ela / 1000 * (self._ela_stack * abs(delta_t) + self._ela_wind * wind_speed**2) ** 0.5
 
         elif self.infiltration_method is None:
             pass
@@ -444,40 +610,36 @@ class Zone:
             max_oa_hr = 0.0115  # From BA HSP
             if t_base is None:
                 t_base = _T_BASE_C
-            # max_oa_rh = 0.7 # Note: removing check for max RH
-            run_nat_vent = (w_amb < max_oa_hr) and (t_zone > t_ext) and (t_zone > t_base)
-            if run_nat_vent and self.open_window_area is not None:
-                area = self.open_window_area * 0.6
-                nat_vent_area = area * _M2_TO_CM2
-                max_nat_flow = 20 * self.volume * _M3HR_TO_M3S  # max 20 ACH
-                adj = (t_zone - t_base) / (t_zone - t_ext)
-                adj = max(min(adj, 1), 0)
-                nat_vent_data = (self.nat_vent_stack_coeff * abs(delta_t)) + self.nat_vent_wind_coeff * (wind_speed**2)
-                nat_vent_flow = nat_vent_area * adj * (nat_vent_data**0.5) / 1000
-                self.nat_vent_flow = min(nat_vent_flow, max_nat_flow)
-            else:
-                self.nat_vent_flow = 0
+            open_window_area = 0.0 if self.open_window_area is None else self.open_window_area
+            self.nat_vent_flow = _natural_ventilation(
+                t_zone,
+                t_ext,
+                t_base,
+                w_amb,
+                wind_speed,
+                open_window_area,
+                self.nat_vent_stack_coeff,
+                self.nat_vent_wind_coeff,
+                self.volume,
+                _M2_TO_CM2,
+                _M3HR_TO_M3S,
+                max_oa_hr,
+            )
 
-        # combine infiltration and ventilation flow
-        total_nat_flow = self.inf_flow + self.nat_vent_flow
-        if self.balanced_ventilation:
-            # All flows are balanced, add in series
-            # total_flow = self.inf_flow + self.forced_vent_flow
-            sensible_flow = total_nat_flow + self.forced_vent_flow * (1 - self.sens_recovery_eff)
-            latent_flow = total_nat_flow + self.forced_vent_flow * (1 - self.lat_recovery_eff)
-        else:
-            # Add balanced + unbalanced in quadrature, reduce natural flows so that the results sum to the total
-            sensible_flow = (total_nat_flow**2 + self.forced_vent_flow**2) ** 0.5
-            latent_flow = sensible_flow
-            nat_flow_ratio = (sensible_flow - self.forced_vent_flow) / total_nat_flow
-            self.inf_flow *= nat_flow_ratio  # for results only
-            self.nat_vent_flow *= nat_flow_ratio  # for results only
-
-        # calculate sensible heat gains
-        sensible_gain = sensible_flow * density * cp_air * delta_t * 1000  # in W
-        if h_limit is not None and abs(sensible_gain) > abs(h_limit):
-            # clip sensible gain based on heat gain limit
-            sensible_gain = h_limit
+        h_limit_float = 0.0 if h_limit is None else h_limit
+        has_h_limit = h_limit is not None
+        sensible_gain, sensible_flow, latent_flow, self.inf_flow, self.nat_vent_flow = _ventilation_flows_and_gain(
+            self.inf_flow,
+            self.nat_vent_flow,
+            self.forced_vent_flow,
+            self.balanced_ventilation,
+            self.sens_recovery_eff,
+            self.lat_recovery_eff,
+            density,
+            delta_t,
+            h_limit_float,
+            has_h_limit,
+        )
 
         # TODO: add heavy ball convergence to fix high wind issues for attics
         # heat_flow = np.clip(heat_flow, 0, 400)
@@ -515,47 +677,32 @@ class Zone:
         for i, s in enumerate(self.surfaces):
             t_boundaries[i] = s.t_boundary
 
-        # excludes radiation
-        t_surf_no_rad = self.s_rad_fractions * t_boundaries + (1 - self.s_rad_fractions) * t_zone
-        t_surf_min = t_surf_no_rad.min()
-        t_surf_max = t_surf_no_rad.max()
-
-        # TODO: try setting temperatures to weighted average of t_surf_no_rad
-        # t_surfaces = np.ones(len(self.surfaces)) * t_surf_no_rad.dot(self.s_view_factors)
-        # t_surfaces_prev = t_surfaces
-
-        # Option 1: Use previous time step surface temperatures to calculate LWR, then recalculate surface temperatures
-        #  - running multiple times per time step for longer time steps
-        #  - adding heavy ball convergence to reduce instability in determining the temperature
+        # Use previous temperatures with heavy-ball damping in a JIT-compiled loop.
         t_surfaces = self._t_surfaces_buf
         t_surfaces_prev = self._t_surfaces_prev_buf
         for i, s in enumerate(self.surfaces):
             t_surfaces[i] = s.temperature
             t_surfaces_prev[i] = s.t_prev
-        max_error = None
-        for _ in range(self.iterations):
-            # get total LWR heat from each surface and to each surface, based on current surface temperatures
-            h_lwr_out = self.s_e_factors * (t_surfaces + degC_to_K) ** 4
-            h_lwr_in = h_lwr_out.sum() * self.s_view_factors
 
-            # update surface temperature based on difference in LWR gain, constrain to min/max values
-            t_surfaces_new = t_surf_no_rad + (h_lwr_in - h_lwr_out) * self.s_rad_resistances
-            t_surfaces_new = t_surfaces_new.clip(t_surf_min, t_surf_max)
-            t_surfaces_new = t_surfaces + 0.3 * (t_surfaces_new - t_surfaces) + 0.2 * (t_surfaces - t_surfaces_prev)
-            t_surfaces_prev = t_surfaces
-            t_surfaces = t_surfaces_new
-            max_error = np.abs(t_surfaces - t_surfaces_prev).max()
-            if max_error < 0.01:
-                break
+        h_lwr_net = _solve_interior_radiation(
+            self.s_e_factors,
+            self.s_rad_fractions,
+            self.s_rad_resistances,
+            self.s_view_factors,
+            t_boundaries,
+            t_surfaces,
+            t_surfaces_prev,
+            t_zone,
+            self.iterations,
+            degC_to_K,
+        )
+
+        max_error = np.abs(t_surfaces - t_surfaces_prev).max()
         if max_error > 1:
             print(f"WARNING: Large fluctuations in {self.name} Zone internal radiation")
         # if t_surfaces.max() - t_surfaces.min() > 25:
         #     print(f'WARNING: Large differences in {self.name} Zone surface temperatures')
 
-        # get final LWR gains
-        h_lwr_out = self.s_e_factors * (t_surfaces + degC_to_K) ** 4
-        h_lwr_in = h_lwr_out.sum() * self.s_view_factors
-        h_lwr_net = h_lwr_in - h_lwr_out
         if abs(h_lwr_net.sum()) > 10:
             raise ModelException(f"{self.name} Zone internal radiation error")
 
@@ -722,6 +869,35 @@ class Envelope(RCModel):
             zone.t_idx = self.input_names.index("T_" + zone.label)
             zone.temperature = self.inputs[zone.t_idx]
 
+        n_ext = len(self.ext_boundaries)
+        self._ext_e_factors = np.array([b.ext_surface.e_factor for b in self.ext_boundaries], dtype=np.float64)
+        self._ext_sky_view_factors = np.array(
+            [b.ext_surface.sky_view_factor for b in self.ext_boundaries],
+            dtype=np.float64,
+        )
+        self._ext_rad_fractions = np.array([b.ext_surface.radiation_frac for b in self.ext_boundaries], dtype=np.float64)
+        self._ext_rad_resistances = np.array([b.ext_surface.radiation_res for b in self.ext_boundaries], dtype=np.float64)
+        self._ext_temperatures = np.array([b.ext_surface.temperature for b in self.ext_boundaries], dtype=np.float64)
+        self._ext_t_prevs = np.array([b.ext_surface.t_prev for b in self.ext_boundaries], dtype=np.float64)
+        self._ext_t_boundaries = np.zeros(n_ext, dtype=np.float64)
+        self._ext_solar_gains = np.zeros(n_ext, dtype=np.float64)
+        self._ext_absorptivities = np.array([b.ext_surface.absorptivity for b in self.ext_boundaries], dtype=np.float64)
+        self._ext_t_idxs = np.array(
+            [b.ext_surface.t_idx if b.ext_surface.t_idx is not None else -1 for b in self.ext_boundaries],
+            dtype=np.int64,
+        )
+        self._ext_h_idxs = np.array(
+            [b.ext_surface.h_idx if b.ext_surface.h_idx is not None else -1 for b in self.ext_boundaries],
+            dtype=np.int64,
+        )
+        self._ext_rad_fracs_to_inputs = np.array(
+            [
+                b.ext_surface.radiation_frac if b.n_nodes != 0 and b.ext_surface.h_idx is not None else 0.0
+                for b in self.ext_boundaries
+            ],
+            dtype=np.float64,
+        )
+
         # Occupancy parameters, units are W/person
         if occupancy is None:
             occupancy = {}
@@ -746,9 +922,15 @@ class Envelope(RCModel):
         for zone in self.zones.values():
             n_surf = len(zone.surfaces)
             if n_surf > 0:
-                zone._t_boundaries_buf = np.empty(n_surf)
-                zone._t_surfaces_buf = np.empty(n_surf)
-                zone._t_surfaces_prev_buf = np.empty(n_surf)
+                zone._t_boundaries_buf = np.zeros(n_surf, dtype=np.float64)
+                zone._t_surfaces_buf = np.zeros(n_surf, dtype=np.float64)
+                zone._t_surfaces_prev_buf = np.zeros(n_surf, dtype=np.float64)
+                zone._window_view_factors = np.array([s.window_view_factor for s in zone.surfaces], dtype=np.float64)
+                zone._h_idxs = np.array(
+                    [s.h_idx if s.h_idx is not None else -1 for s in zone.surfaces],
+                    dtype=np.int64,
+                )
+                zone._radiation_fracs = np.array([s.radiation_frac for s in zone.surfaces], dtype=np.float64)
 
         for boundary in self.ext_boundaries:
             boundary._irradiance_key = f"{boundary.name} Irradiance (W)"
@@ -883,7 +1065,7 @@ class Envelope(RCModel):
         # linearizes infiltration equation: H_ab = inf_heat = k * (T_ext - T_zone), k = 1/Rab
         # k depends on infiltration method
         # assumes operating point of vent_rate=<initial_value>, delta_t=10C, wind_speed=<initial_value>
-        wind_speed_op = initial_schedule.get("Wind Speed (m/s)")
+        wind_speed_op = initial_schedule.get("Wind Speed (m/s)", 0.0) or 0.0
         vent_cfm_op = initial_schedule.get("Ventilation Rate (cfm)", 0)
         pressure_op = initial_schedule.get("Ambient Pressure (kPa)", 101.325)
         t_ext_op = 10  # in C
@@ -911,22 +1093,55 @@ class Envelope(RCModel):
         t_ext = self.current_schedule["Ambient Dry Bulb (C)"]
         t_sky = self.current_schedule.get("Sky Temperature (C)")
 
+        n_ext = len(self.ext_boundaries)
+        if n_ext > 0:
+            solar_gains = self._ext_solar_gains
+            for i, boundary in enumerate(self.ext_boundaries):
+                solar_gains[i] = self.current_schedule.get(boundary._irradiance_key, 0) * self._ext_absorptivities[i]
+
+            if not self.reduced:
+                t_boundaries = self._ext_t_boundaries
+                for i, t_idx in enumerate(self._ext_t_idxs):
+                    assert t_idx >= 0
+                    t_boundaries[i] = self.states[t_idx]
+
+            if self.run_external_rad:
+                t_sky_valid = t_sky is not None and not np.isnan(t_sky)
+                t_sky_float = float(t_sky) if t_sky_valid else 0.0
+                lwr_gains = _solve_exterior_radiation(
+                    self._ext_e_factors,
+                    self._ext_sky_view_factors,
+                    self._ext_rad_fractions,
+                    self._ext_rad_resistances,
+                    self._ext_t_boundaries,
+                    self._ext_temperatures,
+                    self._ext_t_prevs,
+                    solar_gains,
+                    t_ext,
+                    t_sky_float,
+                    t_sky_valid,
+                    self.ext_boundaries[0].ext_surface.iterations,
+                    degC_to_K,
+                )
+            else:
+                lwr_gains = None
+
         # Calculate external radiation (solar and LWR) by boundary
-        for boundary in self.ext_boundaries:
+        for i, boundary in enumerate(self.ext_boundaries):
             surface = boundary.ext_surface
-            solar_gain = self.current_schedule.get(boundary._irradiance_key, 0)
 
             # get surface absorbed solar gain
-            surface.solar_gain = solar_gain * surface.absorptivity
+            surface.solar_gain = self._ext_solar_gains[i]
             h_radiation = surface.solar_gain
 
             # get long wave exterior radiation gain
             if not self.reduced:
-                assert surface.t_idx is not None
-                surface.t_boundary = self.states[surface.t_idx]
+                surface.t_boundary = self._ext_t_boundaries[i]
             if self.run_external_rad:
-                surface.calculate_exterior_radiation(t_ext, t_sky)
-                h_radiation += surface.lwr_gain
+                surface.temperature = self._ext_temperatures[i]
+                surface.t_prev = self._ext_t_prevs[i]
+                surface.lwr_gain = lwr_gains[i]
+                h_radiation += lwr_gains[i]
 
             # add solar and exterior radiation gains to inputs
             if boundary.n_nodes == 0:
@@ -936,21 +1151,24 @@ class Envelope(RCModel):
                 surface.radiation_to_zone += h_radiation * surface.radiation_frac
                 zone.radiation_heat += h_radiation * surface.radiation_frac
             else:
-                self.inputs_init[surface.h_idx] += h_radiation * surface.radiation_frac
+                h_idx = self._ext_h_idxs[i]
+                if h_idx >= 0:
+                    self.inputs_init[h_idx] += h_radiation * self._ext_rad_fracs_to_inputs[i]
 
             # Get solar radiation transmitted through windows, injected into zone and other boundaries
+            solar_gain = self.current_schedule.get(boundary._irradiance_key, 0)
             surface.transmitted_gain = solar_gain * surface.transmittance
             if surface.transmitted_gain > 0:
                 zone = self.zones[boundary.int_surface.zone_name]
 
                 # add fraction of window solar gains to each surface, based on area and absorptivity ratios
                 # Note: some heat is reflected back out of the windows and lost
-                for s in zone.surfaces:
-                    factor = surface.transmitted_gain * s.window_view_factor
-                    if s.h_idx is not None:
-                        self.inputs_init[s.h_idx] += factor * s.radiation_frac
-                    surface.radiation_to_zone += factor * (1 - s.radiation_frac)
-                    zone.radiation_heat += factor * (1 - s.radiation_frac)
+                factors = surface.transmitted_gain * zone._window_view_factors
+                valid = zone._h_idxs >= 0
+                np.add.at(self.inputs_init, zone._h_idxs[valid], factors[valid] * zone._radiation_fracs[valid])
+                zone_contrib = (factors * (1.0 - zone._radiation_fracs)).sum()
+                surface.radiation_to_zone += zone_contrib
+                zone.radiation_heat += zone_contrib
 
         # Calculate internal radiation by zone
         for zone in self.zones.values():
@@ -986,16 +1204,12 @@ class Envelope(RCModel):
 
         # Get schedule values
         t_ext = self.current_schedule["Ambient Dry Bulb (C)"]
-        wind_speed = self.current_schedule.get("Wind Speed (m/s)")
-        w_amb = self.current_schedule.get("Ambient Humidity Ratio (-)")
+        wind_speed = self.current_schedule.get("Wind Speed (m/s)", 0.0) or 0.0
+        w_amb = self.current_schedule.get("Ambient Humidity Ratio (-)", 0.0) or 0.0
         pressure = self.current_schedule.get("Ambient Pressure (kPa)", 101.325)
 
         # Calculate outdoor dry air density, used for calculating infiltration/ventilation heat gains
-        if w_amb is not None:
-            density = HumidityModel.get_dry_air_density(t_ext, w_amb, pressure)
-        else:
-            # use typical value
-            density = 1.225
+        density = HumidityModel.get_dry_air_density(t_ext, w_amb, pressure)
 
         # calculate infiltration for all zones, ventilation for Indoor zone only
         for zone in self.zones.values():
@@ -1009,7 +1223,7 @@ class Envelope(RCModel):
                 h_limit -= ext_gains
 
             if zone.name == "Indoor":
-                vent_cfm = self.current_schedule.get("Ventilation Rate (cfm)", 0)
+                vent_cfm = self.current_schedule.get("Ventilation Rate (cfm)", 0.0) or 0.0
                 if self.heating_setpoint is not None and self.cooling_setpoint is not None:
                     t_base = (self.heating_setpoint + self.cooling_setpoint) / 2
                 else:

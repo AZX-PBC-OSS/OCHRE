@@ -1,8 +1,10 @@
 import math
+import warnings
 import numpy as np
 import psychrolib
 
 from ochre.utils import OCHREException, load_csv, convert
+from ochre.utils.psychrolib_jit import _calculate_shr_jit
 
 psychrolib.SetUnitSystem(psychrolib.SI)
 
@@ -678,7 +680,7 @@ def calculate_mass_flow_rate(DBin, Win, P, flow):
     return mfr
 
 
-def calculate_shr(DBin, Win, P, Q, flow, Ao):
+def _calculate_shr_legacy(DBin, Win, P, Q, flow, Ao):
     """
     Description:
      ------------
@@ -748,6 +750,13 @@ def calculate_shr(DBin, Win, P, Q, flow, Ao):
     else:
         shr = 1
 
+    return shr, cvg
+
+
+def calculate_shr(DBin, Win, P, Q, flow, Ao):
+    shr, converged = _calculate_shr_jit(DBin, Win, P, Q, flow, Ao)
+    if not converged:
+        warnings.warn(f"SHR iteration did not converge: T_db={DBin}, W={Win}", RuntimeWarning, stacklevel=2)
     return shr
 
 

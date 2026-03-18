@@ -287,6 +287,63 @@ class NaturalVentilationUnitTestCase(unittest.TestCase):
         self.assertEqual(zone.nat_vent_flow, 0)
 
 
+class InfiltrationVentilationFlowUnitTestCase(unittest.TestCase):
+    def test_balanced_vent_preserves_distinct_latent_recovery(self):
+        envelope = create_minimal_envelope(
+            zones={
+                "Indoor": {
+                    "Volume (m^3)": 600,
+                    "Balanced Ventilation": True,
+                    "Sensible Recovery Efficiency (-)": 0.7,
+                    "Latent Recovery Efficiency (-)": 0.2,
+                },
+            },
+        )
+        zone = envelope.indoor_zone
+        zone.humidity.latent_gains_init = 0.0
+        w_amb = 0.010
+        density = 1.2
+
+        zone.update_infiltration(
+            t_ext=20.0,
+            t_zone=25.0,
+            wind_speed=0.0,
+            density=density,
+            w_amb=w_amb,
+            vent_cfm=100.0,
+        )
+
+        latent_flow_expected = zone.forced_vent_flow * (1.0 - zone.lat_recovery_eff)
+        latent_gains_expected = latent_flow_expected * zone.humidity.h_vap * density * 1000.0 * (w_amb - zone.humidity.w)
+        self.assertAlmostEqual(zone.humidity.latent_gains_init, latent_gains_expected, places=6)
+
+    def test_unbalanced_zero_nat_flow_keeps_result_flows_finite(self):
+        envelope = create_minimal_envelope(
+            zones={
+                "Indoor": {
+                    "Volume (m^3)": 600,
+                    "Balanced Ventilation": False,
+                    "enable_humidity": False,
+                },
+            },
+        )
+        zone = envelope.indoor_zone
+
+        zone.update_infiltration(
+            t_ext=20.0,
+            t_zone=25.0,
+            wind_speed=0.0,
+            density=1.2,
+            w_amb=0.005,
+            vent_cfm=0.0,
+        )
+
+        self.assertFalse(np.isnan(zone.inf_flow))
+        self.assertFalse(np.isnan(zone.nat_vent_flow))
+        self.assertEqual(zone.inf_flow, 0.0)
+        self.assertEqual(zone.nat_vent_flow, 0.0)
+
+
 class EnvelopeRadiationTestCase(unittest.TestCase):
     """Tests for radiation methods"""
 

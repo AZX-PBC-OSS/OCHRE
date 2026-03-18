@@ -1,5 +1,7 @@
 import psychrolib
 
+from ochre.utils.psychrolib_jit import _update_humidity
+
 psychrolib.SetUnitSystem(psychrolib.SI)
 
 
@@ -50,23 +52,9 @@ class HumidityModel:
             self.latent_gains * self._dt_seconds / 1000 / (self.density * self.volume * self.h_vap)
         )
         # w_outdoor = psychrolib.GetHumRatioFromRelHum(t_outdoor, rh_outdoor, p_outdoor)
-
-        # Update moisture balance calculations
-        self.w += latent_gains_w / self.humidity_cap_mult
-        if self.w < 0:
-            self.w = 0
-            # TODO: add warnings back after running test suite (intgain test has high latent gains)
-            # print("WARNING: Indoor Relative Humidity less than 0%, double check inputs.")
-
-        # Calculate relative humidity, density, and wet bulb temp
-        self.rh = psychrolib.GetRelHumFromHumRatio(t_indoor, self.w, self.pressure)
-        if self.rh > 1:
-            # print("WARNING: Indoor Relative Humidity greater than 100%, condensation is occurring.")
-            self.rh = 1
-            self.w = psychrolib.GetHumRatioFromRelHum(t_indoor, self.rh, self.pressure)
-
-        self.density = psychrolib.GetMoistAirDensity(t_indoor, self.w, self.pressure)  # kg/m^3
-        self.wet_bulb = psychrolib.GetTWetBulbFromHumRatio(t_indoor, self.w, self.pressure)
+        self.w, self.rh, self.density, self.wet_bulb = _update_humidity(
+            self.w, latent_gains_w, self.humidity_cap_mult, t_indoor, self.pressure
+        )
 
     @staticmethod
     def get_dry_air_density(t, w, p):

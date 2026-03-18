@@ -1,9 +1,11 @@
 import math
 import datetime as dt
 import numpy as np
+import numba as nb
 import psychrolib
 
 from ochre.utils import OCHREException, convert, load_csv
+from ochre.utils.psychrolib_jit import get_t_wet_bulb_from_hum_ratio
 from ochre.utils.units import kwh_to_therms
 import ochre.utils.equipment as utils_equipment
 from ochre.Equipment import Equipment
@@ -17,6 +19,45 @@ SPEED_TYPES = {
 
 cp_air = 1.005  # kJ/kg-K
 rho_air = 1.2041  # kg/m^3
+
+
+@nb.njit(cache=True, fastmath=True)
+def _biquadratic(
+    t_in,
+    t_ext,
+    coeffs_t,
+    ff,
+    coeffs_ff,
+    plr,
+    coeffs_plr,
+    rated,
+    min_twb,
+    max_twb,
+    min_tdb,
+    max_tdb,
+    min_ff,
+    max_ff,
+    min_plf,
+    max_plf,
+):
+    t_in = min(max(t_in, min_twb), max_twb)
+    t_ext = min(max(t_ext, min_tdb), max_tdb)
+    ff = min(max(ff, min_ff), max_ff)
+
+    t_ratio = (
+        coeffs_t[0]
+        + coeffs_t[1] * t_in
+        + coeffs_t[2] * t_in * t_in
+        + coeffs_t[3] * t_ext
+        + coeffs_t[4] * t_ext * t_ext
+        + coeffs_t[5] * t_in * t_ext
+    )
+    ff_ratio = coeffs_ff[0] + coeffs_ff[1] * ff + coeffs_ff[2] * ff * ff
+
+    plf_ratio = coeffs_plr[0] + coeffs_plr[1] * plr + coeffs_plr[2] * plr * plr
+    plf_ratio = min(max(plf_ratio, min_plf), max_plf)
+
+    return rated * t_ratio * ff_ratio / plf_ratio
 
 
 class HVAC(Equipment):
@@ -434,12 +475,12 @@ class HVAC(Equipment):
         if self.fan_power_max:
             # calculate increased dry and wet bulb temperatures due to fan power
             self.coil_input_db += self.fan_power_per_flow_rate / 1000 / rho_air / cp_air
-            self.coil_input_wb = psychrolib.GetTWetBulbFromHumRatio(self.coil_input_db, w_in, pres_int)
+            self.coil_input_wb = get_t_wet_bulb_from_hum_ratio(self.coil_input_db, w_in, pres_int)
         elif self.zone.humidity is not None:
             # Don't recalculate wet bulb if already done in humidity model
             self.coil_input_wb = self.zone.humidity.wet_bulb
         else:
-            self.coil_input_wb = psychrolib.GetTWetBulbFromHumRatio(self.coil_input_db, w_in, pres_int)
+            self.coil_input_wb = get_t_wet_bulb_from_hum_ratio(self.coil_input_db, w_in, pres_int)
 
         # Calculate SHR based on speed
         speed_low = int(self.speed_idx // 1)  # 0 is the lowest speed
@@ -777,20 +818,20 @@ class DynamicHVAC(HVAC):
             )
         biquad_params = {
             idx + 1: {
-                "eir_t": np.array([val[f"{x}_eir_t"] for x in "abcdef"], dtype=float),
-                "eir_ff": np.array([val[f"{x}_eir_ff"] for x in "abc"], dtype=float),
-                "eir_plr": np.array([val[f"{x}_eir_plr"] for x in "abc"], dtype=float),
-                "cap_t": np.array([val[f"{x}_cap_t"] for x in "abcdef"], dtype=float),
-                "cap_ff": np.array([val[f"{x}_cap_ff"] for x in "abc"], dtype=float),
-                "cap_plr": np.array([1, 0, 0], dtype=float),
-                "min_Twb": val.get("min_Twb", -100),
-                "max_Twb": val.get("max_Twb", 100),
-                "min_Tdb": val.get("min_Tdb", -100),
-                "max_Tdb": val.get("max_Tdb", 100),
-                "min_ff": val.get("min_ff", 0),
-                "max_ff": val.get("max_ff", 1),
-                "min_plf": val.get("min_plf", 0.7),
-                "max_plf": val.get("max_plf", 1),
+                "eir_t": np.ascontiguousarray(np.array([val[f"{x}_eir_t"] for x in "abcdef"], dtype=np.float64)),
+                "eir_ff": np.ascontiguousarray(np.array([val[f"{x}_eir_ff"] for x in "abc"], dtype=np.float64)),
+                "eir_plr": np.ascontiguousarray(np.array([val[f"{x}_eir_plr"] for x in "abc"], dtype=np.float64)),
+                "cap_t": np.ascontiguousarray(np.array([val[f"{x}_cap_t"] for x in "abcdef"], dtype=np.float64)),
+                "cap_ff": np.ascontiguousarray(np.array([val[f"{x}_cap_ff"] for x in "abc"], dtype=np.float64)),
+                "cap_plr": np.ascontiguousarray(np.array([1, 0, 0], dtype=np.float64)),
+                "min_Twb": float(val.get("min_Twb", -100)),
+                "max_Twb": float(val.get("max_Twb", 100)),
+                "min_Tdb": float(val.get("min_Tdb", -100)),
+                "max_Tdb": float(val.get("max_Tdb", 100)),
+                "min_ff": float(val.get("min_ff", 0)),
+                "max_ff": float(val.get("max_ff", 1)),
+                "min_plf": float(val.get("min_plf", 0.7)),
+                "max_plf": float(val.get("max_plf", 1)),
             }
             for idx, (col, val) in enumerate(biquad_params.items())
         }
@@ -800,7 +841,7 @@ class DynamicHVAC(HVAC):
         if kwargs.get("Disable HVAC Part Load Factor", False):
             # for minimal tests, disable PLF
             for key in biquad_params:
-                biquad_params[key]["eir_plr"] = np.array([1, 0, 0], dtype=float)
+                biquad_params[key]["eir_plr"] = np.ascontiguousarray(np.array([1, 0, 0], dtype=np.float64))
 
         return biquad_params
 
@@ -908,23 +949,24 @@ class DynamicHVAC(HVAC):
         t_in = self.coil_input_db if self.is_heater else self.coil_input_wb
         t_ext_db = self.current_schedule["Ambient Dry Bulb (C)"]
 
-        # clip temperatures, flow fraction, part load ratio to stay within bounds
-        t_in = min(max(t_in, params["min_Twb"]), params["max_Twb"])
-        t_ext_db = min(max(t_ext_db, params["min_Tdb"]), params["max_Tdb"])
-        flow_fraction = min(max(flow_fraction, params["min_ff"]), params["max_ff"])
-
-        # Coefficient order must match the arrays in initialize_biquad_params().
-        ct = params[param + "_t"]
-        t_ratio = ct[0] + ct[1] * t_in + ct[2] * t_in**2 + ct[3] * t_ext_db + ct[4] * t_ext_db**2 + ct[5] * t_in * t_ext_db
-
-        cf = params[param + "_ff"]
-        ff_ratio = cf[0] + cf[1] * flow_fraction + cf[2] * flow_fraction**2
-
-        cp = params[param + "_plr"]
-        plf_ratio = cp[0] + cp[1] * part_load_ratio + cp[2] * part_load_ratio**2
-        plf_ratio = min(max(plf_ratio, params["min_plf"]), params["max_plf"])
-
-        return rated * t_ratio * ff_ratio / plf_ratio
+        return _biquadratic(
+            t_in=t_in,
+            t_ext=t_ext_db,
+            coeffs_t=params[param + "_t"],
+            ff=flow_fraction,
+            coeffs_ff=params[param + "_ff"],
+            plr=part_load_ratio,
+            coeffs_plr=params[param + "_plr"],
+            rated=rated,
+            min_twb=params["min_Twb"],
+            max_twb=params["max_Twb"],
+            min_tdb=params["min_Tdb"],
+            max_tdb=params["max_Tdb"],
+            min_ff=params["min_ff"],
+            max_ff=params["max_ff"],
+            min_plf=params["min_plf"],
+            max_plf=params["max_plf"],
+        )
 
     def calc_startup_capacity_degredation(self):
         if self.c_d == 0.0:
