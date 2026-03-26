@@ -206,8 +206,10 @@ def parse_hpxml_surface(bd_name, bd_data):
     elif bd_name == "Window":
         out.update(
             {
-                "U Factor (W/m^2-K)": bd_data.get(
-                    "UFactor",
+                "U Factor (W/m^2-K)": convert(
+                    bd_data.get("UFactor"),
+                    "Btu / (hour * ft**2 * delta_degF)",
+                    "W / (m**2 * delta_degC)",
                 ),
                 "SHGC (-)": bd_data.get("SHGC"),
                 "Shading Fraction (-)": bd_data.get("InteriorShading", {}).get("SummerShadingCoefficient"),
