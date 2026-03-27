@@ -198,8 +198,8 @@ class EventBasedLoad(Equipment):
         if self.event_index == len(self.all_events):
             # no more events - reset to last event index and move start/end times to the end of the simulation
             self.event_index -= 1
-            self.all_events.loc[self.event_index, "start_time"] = pd.Timestamp.max
-            self.all_events.loc[self.event_index, "end_time"] = pd.Timestamp.max
+            self.all_events.loc[self.event_index, "start_time"] = pd.Timestamp("2200-01-01")
+            self.all_events.loc[self.event_index, "end_time"] = pd.Timestamp("2200-01-01")
 
         self.event_start = self.all_events.loc[self.event_index, "start_time"]
         self.event_end = self.all_events.loc[self.event_index, "end_time"]
