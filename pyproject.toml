@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "ochre-nrel"
 dynamic = ["version"]
 dependencies = [
-    "numpy ~= 1.26",
+    "numpy >= 1.26",
     "pandas >=1.4, <3.0",
     "scipy ~= 1.15",
     "matplotlib ~= 3.10",
@@ -25,7 +25,7 @@ dependencies = [
     "boto3 ~= 1.36",
     "ruff>=0.14.14",
 ]
-requires-python = ">=3.10, <3.13"
+requires-python = ">=3.10, <3.14"
 authors = [
   { name="Jeff Maguire", email="Jeff.Maguire@nrel.gov" },
   { name="Michael Blonsky", email="Michael.Blonsky@nrel.gov" },
