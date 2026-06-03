@@ -15,6 +15,7 @@ from ochre.utils.envelope import calculate_solar_irradiance
 SCHEDULE_NAMES = {
     "Occupancy": {
         "occupants": "Occupancy",
+        "Occupancy (Persons)": "Occupancy",
     },
     "Power": {
         "clothes_washer": "Clothes Washer",
