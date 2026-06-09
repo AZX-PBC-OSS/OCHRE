@@ -469,6 +469,7 @@ def import_occupancy_schedule(
             raise OCHREException(f"Unknown column in schedule: {hpxml_name}")
 
     schedule = pd.concat(schedule_data, axis=1)
+    schedule = schedule.loc[:, ~schedule.columns.duplicated()]
 
     # Add ventilation fan power and flow rate - constant schedule
     if "Ventilation Fan" in equipment:
@@ -611,6 +612,7 @@ def load_schedule(properties, schedule=None, time_zone=None, **house_args):
 
     # combine weather and main schedule
     schedule_init = pd.concat([df_weather, df_occupancy], axis=1)
+    schedule_init = schedule_init.loc[:, ~schedule_init.columns.duplicated()]
 
     schedule = schedule_init
 
