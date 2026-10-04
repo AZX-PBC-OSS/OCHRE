@@ -7,7 +7,7 @@ name = "ochre-nrel"
 dynamic = ["version"]
 dependencies = [
     "numpy ~= 1.26",
-    "pandas >=1.4, <3.0",
+    "pandas >=2.0, <3.0",
     "scipy ~= 1.15",
     "matplotlib ~= 3.10",
     "pint == 0.23",
