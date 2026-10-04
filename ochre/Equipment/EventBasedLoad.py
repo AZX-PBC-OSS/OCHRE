@@ -198,8 +198,13 @@ class EventBasedLoad(Equipment):
         if self.event_index == len(self.all_events):
             # no more events - reset to last event index and move start/end times to the end of the simulation
             self.event_index -= 1
-            self.all_events.loc[self.event_index, "start_time"] = pd.Timestamp.max
-            self.all_events.loc[self.event_index, "end_time"] = pd.Timestamp.max
+            # pd.Timestamp.max is at nanosecond resolution and cannot be written into a datetime
+            # column at a coarser resolution (e.g. datetime64[us], the pandas 3 default), so build
+            # the sentinel at each column's own resolution instead
+            start_times = self.all_events["start_time"]
+            end_times = self.all_events["end_time"]
+            self.all_events.loc[self.event_index, "start_time"] = pd.Timestamp.max.as_unit(start_times.dt.unit)
+            self.all_events.loc[self.event_index, "end_time"] = pd.Timestamp.max.as_unit(end_times.dt.unit)
 
         self.event_start = self.all_events.loc[self.event_index, "start_time"]
         self.event_end = self.all_events.loc[self.event_index, "end_time"]
